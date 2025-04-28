@@ -1,0 +1,340 @@
+{\rtf1\ansi\ansicpg1252\cocoartf2821
+\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
+{\colortbl;\red255\green255\blue255;}
+{\*\expandedcolortbl;;}
+\paperw11900\paperh16840\margl1440\margr1440\vieww44600\viewh22040\viewkind0
+\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+
+\f0\fs24 \cf0 """\
+Galway Cultural Value Index (CVI) \'96 Unified Pipeline **+ Streamlit UI**\
+=====================================================================\
+**File:** `galway_cvi_pipeline.py`  \'95  Version\'a00.3\'a0(28\'a0Apr\'a02025)\
+\
+This single script now does **three jobs**:\
+\
+1. **Library** \'96 exposes functions (`compute_indices()`, etc.) any analyst or\
+   dashboard can import.\
+2. **CLI** \'96 still works via `python galway_cvi_pipeline.py --out file.csv`.\
+3. **Streamlit one\uc0\u8209 click app** \'96 run `streamlit run galway_cvi_pipeline.py` and\
+   you get a point\uc0\u8209 and\u8209 click interface (no code visible to the user).\
+\
+Everything lives in one file so you stay within your non\uc0\u8209 coder comfort zone:\
+*No virtual\uc0\u8209 env juggling, no multi\u8209 module imports.*\
+"""\
+from __future__ import annotations\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56550 \'a0Standard libs\
+# ---------------------------------------------------------------------------\
+import argparse\
+import datetime as dt\
+import json\
+import logging\
+import os\
+import pathlib\
+import re\
+import sys\
+from dataclasses import dataclass, field\
+from typing import Dict, List\
+\
+# Third\uc0\u8209 party (make sure the Streamlit Cloud / local env has these)\
+import pandas as pd\
+import requests\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56615 \'a0Global settings & paths\
+# ---------------------------------------------------------------------------\
+BASE_DIR = pathlib.Path(__file__).resolve().parent\
+RAW_DIR = BASE_DIR / "data" / "raw"\
+PROC_DIR = BASE_DIR / "data" / "processed"\
+RAW_DIR.mkdir(parents=True, exist_ok=True)\
+PROC_DIR.mkdir(parents=True, exist_ok=True)\
+\
+FIRST_YEAR = 2015\
+CURRENT_YEAR = dt.datetime.now().year - 1  # most sources are t\uc0\u8209 1\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56523 \'a0Indicator catalogue\
+# ---------------------------------------------------------------------------\
+\
+def _default_weight(dim: str) -> float:\
+    return \{\
+        "cultural_vibrancy": 1 / 3,\
+        "creative_economy": 1 / 4,\
+        "enabling_env": 1 / 4,\
+    \}[dim]\
+\
+\
+@dataclass\
+class Indicator:\
+    name: str\
+    provider: str  # pxstat | screen_ireland | ticketmaster | file\
+    source_id: str  # table code, API endpoint, or filename\
+    selector: Dict[str, str | list[str]] | None\
+    transform: str  # e.g. "sum", "count", "sum / population * 1_000"\
+    dimension: str\
+    weight: float = field(default_factory=lambda: 0.0)\
+    postprocess: str | None = None\
+    notes: str = ""\
+\
+    def __post_init__(self):\
+        if not self.weight:\
+            self.weight = _default_weight(self.dimension)\
+\
+\
+INDICATORS: List[Indicator] = [\
+    # --- PxStat employment in creative NACE codes -------------------------\
+    Indicator(\
+        name="creative_industry_employment",\
+        provider="pxstat",\
+        source_id="TABLE_CODE_EMP_NACE",  # TODO replace with real table ID\
+        selector=\{\
+            "NACE Rev2": ["J58", "J59", "J60", "M71", "R90", "R91"],\
+            "Statistic": "Persons Employed",\
+            "County": "Galway",\
+        \},\
+        transform="sum",\
+        dimension="creative_economy",\
+        postprocess="per_capita",\
+    ),\
+    # --- Screen\'a0Ireland production days -----------------------------------\
+    Indicator(\
+        name="film_production_days",\
+        provider="screen_ireland",\
+        source_id="https://api.screenireland.ie/productions?county=Galway",\
+        selector=None,\
+        transform="sum",\
+        dimension="creative_economy",\
+        weight=0.25,\
+    ),\
+    # --- Ticketmaster arts & theatre events --------------------------------\
+    Indicator(\
+        name="ticketmaster_culture_events",\
+        provider="ticketmaster",\
+        source_id="dmaId=602&classificationName=Arts%20%26%20Theatre",\
+        selector=None,\
+        transform="count",\
+        dimension="cultural_vibrancy",\
+        weight=0.34,\
+    ),\
+]\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55356 \u57104 \'a0Provider helpers\
+# ---------------------------------------------------------------------------\
+API_PXSTAT = "https://ws.cso.ie/public/api.restful/PxStat/JSON/statistics/\{\}"\
+TICKETMASTER_DISCOVERY = (\
+    "https://app.ticketmaster.com/discovery/v2/events.json?apikey=\{api_key\}&\{query\}"\
+    "&size=200&startDateTime=\{year\}-01-01T00:00:00Z&endDateTime=\{year\}-12-31T23:59:59Z"\
+)\
+\
+\
+def _raw_path(label: str, year: int | None = None) -> pathlib.Path:\
+    suffix = f"_\{year\}" if year else ""\
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", label)\
+    return RAW_DIR / f"\{safe\}\{suffix\}.json"\
+\
+\
+# ---- PxStat ---------------------------------------------------------------\
+\
+def fetch_pxstat(table: str) -> pd.DataFrame:\
+    raw = _raw_path(table)\
+    if raw.exists():\
+        text = raw.read_text()\
+    else:\
+        url = API_PXSTAT.format(table)\
+        logging.info("PxStat \uc0\u8594  %s", url)\
+        text = requests.get(url, timeout=60).text\
+        raw.write_text(text)\
+    data = json.loads(text)["statistic"]\
+    return pd.json_normalize(data, max_level=1)\
+\
+\
+# ---- Screen\'a0Ireland --------------------------------------------------------\
+\
+def fetch_screen_ireland(url: str) -> pd.DataFrame:\
+    raw = _raw_path("screen_ireland")\
+    if raw.exists():\
+        text = raw.read_text()\
+    else:\
+        logging.info("Screen\'a0Ireland \uc0\u8594  %s", url)\
+        text = requests.get(url, timeout=60).text\
+        raw.write_text(text)\
+    return pd.DataFrame(json.loads(text))  # expects 'year' & 'production_days'\
+\
+\
+# ---- Ticketmaster ----------------------------------------------------------\
+\
+def fetch_ticketmaster(query: str, year: int) -> int:\
+    key = os.getenv("TICKETMASTER_API_KEY")\
+    if not key:\
+        raise RuntimeError("Set env var TICKETMASTER_API_KEY (ask arts office)")\
+    url = TICKETMASTER_DISCOVERY.format(api_key=key, query=query, year=year)\
+    raw = _raw_path("ticketmaster", year)\
+    if raw.exists():\
+        text = raw.read_text()\
+    else:\
+        logging.info("Ticketmaster \uc0\u8594  %s %s", query, year)\
+        text = requests.get(url, timeout=60).text\
+        raw.write_text(text)\
+    return int(json.loads(text).get("page", \{\}).get("totalElements", 0))\
+\
+\
+# ---- Generic file ----------------------------------------------------------\
+\
+def fetch_file(path: str) -> pd.DataFrame:\
+    fp = pathlib.Path(path)\
+    if not fp.exists():\
+        raise FileNotFoundError(fp)\
+    return pd.read_csv(fp) if fp.suffix == ".csv" else pd.read_json(fp)\
+\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u57056 \'a0Data wrangling helpers\
+# ---------------------------------------------------------------------------\
+\
+def _filter_dims(df: pd.DataFrame, selector: Dict[str, str | list[str]] | None) -> pd.DataFrame:\
+    if not selector:\
+        return df\
+    for dim, val in selector.items():\
+        df = df[df[dim].isin(val)] if isinstance(val, list) else df[df[dim] == val]\
+    return df\
+\
+\
+def _fill(series: pd.Series) -> pd.Series:\
+    return series.fillna(method="ffill")\
+\
+\
+def _population(year: int) -> int:\
+    pops = \{2015: 258058, 2016: 258552, 2017: 259003, 2018: 260997, 2019: 263073,\
+            2020: 264640, 2021: 266943, 2022: 270160, 2023: 272400, 2024: 274650\}\
+    return pops.get(year, pops[max(pops)])\
+\
+\
+def _safe_eval(expr: str, local: Dict) -> float:\
+    allowed = \{k: v for k, v in local.items() if k.isidentifier()\}\
+    return eval(expr, \{"__builtins__": \{\}\}, allowed)\
+\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56520 \'a0Build indicator series\
+# ---------------------------------------------------------------------------\
+\
+def series_for(ind: Indicator) -> pd.Series:\
+    if ind.provider == "pxstat":\
+        df = fetch_pxstat(ind.source_id)\
+        df = _filter_dims(df, ind.selector)[["Year", "value"]]\
+        df = df.rename(columns=\{"value": ind.name\}).set_index("Year")\
+\
+    elif ind.provider == "screen_ireland":\
+        df = fetch_screen_ireland(ind.source_id).rename(\
+            columns=\{"year": "Year", "production_days": ind.name\}).set_index("Year")\
+\
+    elif ind.provider == "ticketmaster":\
+        df = pd.Series(\{y: fetch_ticketmaster(ind.source_id, y)\
+                        for y in range(FIRST_YEAR, CURRENT_YEAR + 1)\},\
+                       name=ind.name).to_frame()\
+    elif ind.provider == "file":\
+        df = fetch_file(ind.source_id)\
+        df = df.set_index("Year")[[ind.name]]\
+    else:\
+        raise ValueError(ind.provider)\
+\
+    # ensure full year range\
+    for y in range(FIRST_YEAR, CURRENT_YEAR + 1):\
+        if y not in df.index:\
+            df.loc[y] = pd.NA\
+    df.sort_index(inplace=True)\
+    df[ind.name] = _fill(df[ind.name].astype(float))\
+\
+    # transforms ----------------------------------------------------------\
+    if ind.transform in \{"sum", "count"\}:\
+        pass  # already fine\
+    elif ind.transform.startswith(("sum /", "count /")):\
+        df[ind.name] = [\
+            _safe_eval(ind.transform, \{\
+                "sum": v, "count": v, "population": _population(y)\})\
+            for y, v in df[ind.name].items()]\
+    else:\
+        raise ValueError(f"Unsupported transform: \{ind.transform\}")\
+\
+    if ind.postprocess == "per_capita":\
+        df[ind.name] = [v / _population(y) * 1_000 for y, v in df[ind.name].items()]\
+\
+    return df[ind.name]\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55358 \u56814 \'a0Aggregate \u8594  CVI\
+# ---------------------------------------------------------------------------\
+\
+def _z(series: pd.Series) -> pd.Series:\
+    return (series - series.mean()) / series.std(ddof=0)\
+\
+\
+def compute_indices() -> pd.DataFrame:\
+    mat = pd.concat([series_for(i) for i in INDICATORS], axis=1)\
+    zmat = mat.apply(_z, axis=0)\
+\
+    dims: Dict[str, pd.Series] = \{\}\
+    for ind in INDICATORS:\
+        dims.setdefault(ind.dimension, 0)\
+        dims[ind.dimension] += zmat[ind.name] * ind.weight\
+    df = pd.DataFrame(dims)\
+    df["CVI"] = df.apply(lambda r: (r + 1).prod() ** (1 / len(r)) - 1, axis=1)\
+    return df\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56415 \'a0CLI entry\
+# ---------------------------------------------------------------------------\
+\
+def _cli(out: pathlib.Path | None):\
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")\
+    res = compute_indices()\
+    res.index.name = "Year"\
+    out = out or PROC_DIR / "galway_cvi_series.csv"\
+    res.to_csv(out)\
+    logging.info("Saved \uc0\u8594  %s", out)\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55356 \u57224 \'a0Streamlit UI (auto\u8209 detect)\
+# ---------------------------------------------------------------------------\
+\
+def _run_streamlit():\
+    import streamlit as st\
+\
+    st.set_page_config(page_title="Galway CVI", layout="wide")\
+    st.title("Galway Cultural Value Index")\
+\
+    # Sidebar \'97 controls\
+    st.sidebar.header("Options")\
+    yr_range = st.sidebar.slider("Year range", FIRST_YEAR, CURRENT_YEAR,\
+                                 (FIRST_YEAR, CURRENT_YEAR))\
+    subcols = ["cultural_vibrancy", "creative_economy", "enabling_env", "CVI"]\
+    to_show = st.sidebar.multiselect("Sub\uc0\u8209 indices to plot", subcols, default=["CVI"])\
+\
+    # Main area\
+    if st.button("Run / Refresh"):\
+        with st.spinner("Crunching numbers \'85"):\
+            df = compute_indices().loc[yr_range[0]: yr_range[1]]\
+        st.success("Done \uc0\u10003 ")\
+        st.line_chart(df[to_show])\
+        st.dataframe(df.round(3))\
+        csv = df.to_csv().encode()\
+        st.download_button("Download CSV", csv, "galway_cvi_series.csv", "text/csv")\
+\
+    st.markdown("---")\
+    st.caption("v0.3 \'a0\'95\'a0 Data cached locally in /data/raw to minimise API calls.")\
+\
+# ---------------------------------------------------------------------------\
+# \uc0\u55357 \u56960 \'a0Dispatch\
+# ---------------------------------------------------------------------------\
+if __name__ == "__main__":\
+    # If running under Streamlit, its runtime patches sys.argv; detect cheaply\
+    if any("streamlit" in arg for arg in sys.argv):\
+        _run_streamlit()\
+    else:\
+        p = argparse.ArgumentParser(description="Galway CVI builder (CLI)")\
+        p.add_argument("--out", type=pathlib.Path, help="CSV output path")\
+        args = p.parse_args()\
+        _cli(args.out)\
+}
